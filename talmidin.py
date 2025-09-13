@@ -1,0 +1,380 @@
+import re
+import os
+import io
+import json
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime
+
+import streamlit as st
+from slugify import slugify
+
+# =======================================
+# Configurações básicas
+# =======================================
+APP_TITLE = "📖 Esboços de Pregações"
+APP_SUBTITLE = "Leitura, busca e navegação nas suas mensagens"
+SERMONS_DIR = Path("sermoes")  # coloque seus .md aqui
+
+st.set_page_config(page_title="Esboços de Pregações", page_icon="📖", layout="wide")
+
+# =======================================
+# Estilos (CSS)
+# =======================================
+CUSTOM_CSS = """
+<style>
+/* largura do conteúdo */
+.main .block-container {max-width: 1200px;}
+
+/* título grande com gradiente leve */
+h1.app-title {
+  font-size: 2.1rem;
+  line-height: 1.1;
+  background: linear-gradient(90deg, #5b7cfa 0%, #7cd4fd 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin-bottom: .25rem;
+}
+p.app-subtitle { margin-top:0; color:#6b7280 }
+
+/* cartões */
+.card {
+  border: 1px solid #e5e7eb;
+  border-radius: 16px;
+  padding: 16px;
+  height: 100%;
+  background: white;
+}
+.card h3 {
+  margin: 0 0 8px 0;
+}
+.meta { color: #6b7280; font-size: .9rem; margin-bottom: 8px; }
+
+/* pílulas */
+.pill {
+  display:inline-block; border:1px solid #e5e7eb;
+  border-radius:999px; padding:4px 10px; margin:2px 6px 2px 0;
+  font-size:.8rem; color:#374151; background:#fafafa;
+}
+
+/* sumário lateral */
+.toc a {
+  display:block; text-decoration:none; color:#374151; padding:4px 0;
+}
+.toc a:hover { color:#111827 }
+
+/* separador suave */
+hr.soft { border:0; border-top:1px solid #f1f5f9; margin: 1.2rem 0; }
+
+/* botão cheio */
+.stDownloadButton>button, .stButton>button {
+  border-radius: 10px;
+}
+
+/* área do corpo do sermão */
+.sermon-content h1, .sermon-content h2, .sermon-content h3 { margin-top: 1.2rem; }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# =======================================
+# Utilidades
+# =======================================
+
+@st.cache_data(show_spinner=False)
+def list_markdown_files() -> List[Path]:
+    SERMONS_DIR.mkdir(exist_ok=True)
+    return sorted(SERMONS_DIR.glob("*.md"))
+
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+def _first_heading(md: str) -> Optional[str]:
+    """
+    Pega o primeiro título nível 1 (# Título) ou, se não houver, nível 2.
+    """
+    for pat in [r"^\s*#\s+(.+)$", r"^\s*##\s+(.+)$"]:
+        m = re.search(pat, md, flags=re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def _extract_metadata(md: str) -> Dict[str, str]:
+    """
+    Metadados heurísticos: procura linhas iniciadas por
+    'Texto-base:', 'Tema:', 'Objetivo:', 'Livro:', 'Tags:', 'Público:'.
+    Tudo opcional.
+    """
+    meta = {}
+    patterns = {
+        "text_base": r"^\s*\*\*?Texto-base\*\*?\s*:\s*(.+)$|^\s*Texto-base\s*:\s*(.+)$",
+        "theme": r"^\s*\*\*?Tema\*\*?\s*:\s*(.+)$|^\s*Tema\s*:\s*(.+)$",
+        "objective": r"^\s*\*\*?Objetivo\*\*?\s*:\s*(.+)$|^\s*Objetivo\s*:\s*(.+)$",
+        "book": r"^\s*\*\*?Livro\*\*?\s*:\s*(.+)$|^\s*Livro\s*:\s*(.+)$",
+        "audience": r"^\s*\*\*?Público(?:-alvo)?\*\*?\s*:\s*(.+)$|^\s*Público(?:-alvo)?\s*:\s*(.+)$",
+        "tags": r"^\s*\*\*?Tags\*\*?\s*:\s*(.+)$|^\s*Tags\s*:\s*(.+)$",
+    }
+    for k, pat in patterns.items():
+        m = re.search(pat, md, flags=re.IGNORECASE | re.MULTILINE)
+        if m:
+            val = (m.group(1) or m.group(2) or "").strip()
+            meta[k] = val
+    # normaliza tags para lista
+    if "tags" in meta:
+        meta["tags_list"] = [t.strip() for t in meta["tags"].split(",") if t.strip()]
+    else:
+        meta["tags_list"] = []
+    return meta
+
+def build_index(files: List[Path]) -> List[Dict]:
+    """
+    Cria um índice com informações para lista/pesquisa.
+    """
+    items = []
+    for p in files:
+        md = _read_text(p)
+        title = _first_heading(md) or p.stem.replace("_", " ").title()
+        meta = _extract_metadata(md)
+        text_preview = re.sub(r"\s+", " ", md.strip())[:400] + ("..." if len(md) > 400 else "")
+        slug = slugify(title)
+        items.append({
+            "path": p,
+            "title": title,
+            "slug": slug,
+            "meta": meta,
+            "preview": text_preview,
+            "updated": datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+        })
+    return items
+
+@st.cache_data(show_spinner=False)
+def get_library() -> List[Dict]:
+    files = list_markdown_files()
+    return build_index(files)
+
+def search_items(items: List[Dict], q: str, book: str, tag: str) -> List[Dict]:
+    def ok(i: Dict) -> bool:
+        # texto-base para busca
+        hay = f"{i['title']} {i['meta'].get('text_base','')} {i['preview']}".lower()
+        if q and q.lower() not in hay:
+            return False
+        if book and book.lower() not in (i["meta"].get("book","").lower()):
+            return False
+        if tag and (tag.lower() not in [t.lower() for t in i["meta"].get("tags_list",[])]):
+            return False
+        return True
+    return [i for i in items if ok(i)]
+
+def get_unique_books(items: List[Dict]) -> List[str]:
+    vals = sorted({i["meta"].get("book","").strip() for i in items if i["meta"].get("book","").strip()})
+    return vals
+
+def get_unique_tags(items: List[Dict]) -> List[str]:
+    tags = set()
+    for i in items:
+        for t in i["meta"].get("tags_list", []):
+            if t:
+                tags.add(t.strip())
+    return sorted(tags)
+
+def extract_toc(md_text: str) -> List[Tuple[int, str, str]]:
+    """
+    Extrai headings (#, ##, ###) para construir um sumário.
+    Retorna lista de (nivel, texto, anchor).
+    """
+    toc = []
+    for m in re.finditer(r"^(#{1,3})\s+(.+)$", md_text, flags=re.MULTILINE):
+        level = len(m.group(1))
+        text = m.group(2).strip()
+        anchor = slugify(text)
+        toc.append((level, text, anchor))
+    return toc
+
+def add_heading_anchors(md_text: str) -> str:
+    """
+    Insere anchors HTML após cada heading para permitir navegação do TOC.
+    """
+    def repl(m):
+        hashes, title = m.group(1), m.group(2)
+        anchor = slugify(title)
+        return f"{hashes} {title}\n<a id='{anchor}'></a>"
+    return re.sub(r"^(#{1,3})\s+(.+)$", repl, md_text, flags=re.MULTILINE)
+
+def render_pills(values: List[str]):
+    if not values: 
+        return
+    st.markdown("".join([f"<span class='pill'>{st.session_state.get('pill_prefix','')}{v}</span>" for v in values]), unsafe_allow_html=True)
+
+# =======================================
+# Header
+# =======================================
+st.markdown(f"<h1 class='app-title'>{APP_TITLE}</h1>", unsafe_allow_html=True)
+st.markdown(f"<p class='app-subtitle'>{APP_SUBTITLE}</p>", unsafe_allow_html=True)
+st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+
+# =======================================
+# Sidebar - Navegação / Filtros
+# =======================================
+with st.sidebar:
+    st.header("Navegação")
+    view = st.radio("Escolha a página", ["📚 Biblioteca", "🖥️ Leitura"], label_visibility="collapsed", key="view_choice")
+    st.markdown("---")
+    st.caption("Coloque seus arquivos `.md` na pasta **sermoes/**.\nO site lê tudo automaticamente.")
+
+# =======================================
+# Carrega biblioteca
+# =======================================
+items = get_library()
+
+# =======================================
+# Biblioteca / Busca
+# =======================================
+if st.session_state.get("view_choice") == "📚 Biblioteca":
+    left, mid, right = st.columns([2, 1, 1])
+    with left:
+        q = st.text_input("🔎 Buscar (título, texto-base, conteúdo)", placeholder="Ex.: Nicodemos, arrependimento, João 3:16")
+    with mid:
+        books = [""] + get_unique_books(items)
+        book = st.selectbox("📘 Livro (opcional)", books, index=0)
+    with right:
+        tags = [""] + get_unique_tags(items)
+        tag = st.selectbox("🏷️ Tag (opcional)", tags, index=0)
+
+    filtered = search_items(items, q, book, tag)
+    st.write(f"**{len(filtered)}** resultado(s).")
+    st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+
+    # grade de cartões (3 colunas)
+    cols = st.columns(3)
+    for idx, it in enumerate(filtered):
+        with cols[idx % 3]:
+            with st.container():
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown(f"### {it['title']}")
+                meta_parts = []
+                if it["meta"].get("text_base"): meta_parts.append(f"**Texto-base:** {it['meta']['text_base']}")
+                if it["meta"].get("theme"): meta_parts.append(f"**Tema:** {it['meta']['theme']}")
+                if it["meta"].get("book"): meta_parts.append(f"**Livro:** {it['meta']['book']}")
+                st.markdown(f"<div class='meta'>{' • '.join(meta_parts)}</div>", unsafe_allow_html=True)
+
+                if it["meta"].get("tags_list"):
+                    render_pills(it["meta"]["tags_list"])
+
+                st.caption(f"Atualizado em {it['updated']}")
+                c1, c2 = st.columns([1,1])
+                with c1:
+                    if st.button("🖥️ Ler", key=f"read_{it['slug']}"):
+                        st.query_params.update({"s": it["slug"]})
+                        st.session_state["view_choice"] = "🖥️ Leitura"
+                        st.rerun()
+                with c2:
+                    # download do próprio .md
+                    md_bytes = it["path"].read_bytes()
+                    st.download_button(
+                        "⬇️ Baixar .md",
+                        data=md_bytes,
+                        file_name=it["path"].name,
+                        mime="text/markdown",
+                        key=f"dl_{it['slug']}"
+                    )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+# =======================================
+# Leitura (página do sermão)
+# =======================================
+else:
+    # determina qual slug abrir: query param ?s=slug ou primeiro da lista
+    qp = st.query_params
+    slug = qp.get("s", [None])[0] if isinstance(qp.get("s"), list) else qp.get("s")
+    current: Optional[Dict] = None
+    if slug:
+        for it in items:
+            if it["slug"] == slug:
+                current = it
+                break
+    if not current and items:
+        current = items[0]  # fallback para o primeiro
+        st.query_params.update({"s": current["slug"]})
+
+    if not current:
+        st.info("Nenhum arquivo encontrado em `sermoes/`. Crie um `.md` e coloque nessa pasta para começar.")
+    else:
+        # conteúdo
+        raw_md = _read_text(current["path"])
+
+        # TOC
+        toc = extract_toc(raw_md)
+        enhanced_md = add_heading_anchors(raw_md)
+
+        # topo
+        top_left, top_right = st.columns([3,1])
+        with top_left:
+            st.markdown(f"## {current['title']}")
+            meta_line = []
+            if current["meta"].get("text_base"): meta_line.append(f"**Texto-base:** {current['meta']['text_base']}")
+            if current["meta"].get("theme"): meta_line.append(f"**Tema:** {current['meta']['theme']}")
+            if current["meta"].get("objective"): meta_line.append(f"**Objetivo:** {current['meta']['objective']}")
+            if current["meta"].get("book"): meta_line.append(f"**Livro:** {current['meta']['book']}")
+            if current["meta"].get("audience"): meta_line.append(f"**Público:** {current['meta']['audience']}")
+            if meta_line:
+                st.markdown(" • ".join(meta_line))
+            if current["meta"].get("tags_list"):
+                render_pills(current["meta"]["tags_list"])
+
+        with top_right:
+            st.caption(f"Atualizado em {current['updated']}")
+            st.download_button(
+                "⬇️ Baixar este .md",
+                data=current["path"].read_bytes(),
+                file_name=current["path"].name,
+                mime="text/markdown",
+            )
+            st.button("📚 Voltar para biblioteca", on_click=lambda: st.session_state.update({"view_choice": "📚 Biblioteca"}))
+
+        st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+
+        # corpo em duas colunas: conteúdo + sumário
+        body, sidebar = st.columns([3,1], gap="large")
+
+        with body:
+            st.markdown("<div class='sermon-content'>", unsafe_allow_html=True)
+            st.markdown(enhanced_md)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with sidebar:
+            st.subheader("📑 Sumário")
+            if toc:
+                st.markdown("<div class='toc'>", unsafe_allow_html=True)
+                for level, text, anchor in toc:
+                    indent = "&nbsp;" * ((level-1)*4)
+                    st.markdown(f"{indent}<a href='#{anchor}'>{text}</a>", unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.caption("Sem títulos detectados. Use `#`, `##`, `###` para criar seções.")
+
+        st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+
+        # navegação entre sermões
+        titles = [it["title"] for it in items]
+        slugs = [it["slug"] for it in items]
+        idx = slugs.index(current["slug"])
+        prev_idx = idx-1 if idx-1 >= 0 else None
+        next_idx = idx+1 if idx+1 < len(items) else None
+        cprev, csp, cnext = st.columns([1,6,1])
+        with cprev:
+            if prev_idx is not None:
+                if st.button("⬅️ Anterior"):
+                    st.query_params.update({"s": slugs[prev_idx]})
+                    st.rerun()
+        with cnext:
+            if next_idx is not None:
+                if st.button("Próximo ➡️"):
+                    st.query_params.update({"s": slugs[next_idx]})
+                    st.rerun()
+
+# =======================================
+# Rodapé
+# =======================================
+st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+st.caption("Caminando para ser cada vez mais pareceido com Cristo ✝")
+    
